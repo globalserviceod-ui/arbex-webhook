@@ -6,7 +6,7 @@ import time
 
 app = FastAPI()
 
-TOKEN = os.environ.get("ARBEX_WEBHOOK_TOKEN", "")
+TOKEN = os.environ.get("ARBEX_WEBHOOK_SECRET", os.environ.get("ARBEX_WEBHOOK_TOKEN", ""))
 
 os.makedirs("received", exist_ok=True)
 
@@ -19,12 +19,15 @@ async def health():
 @app.post("/webhook")
 async def webhook(
     request: Request,
-    authorization: str | None = Header(default=None)
+    x_arbex_webhook_secret: str | None = Header(default=None),
+    authorization: str | None = Header(default=None),
 ):
     if not TOKEN:
         raise HTTPException(status_code=500, detail="Token not configured")
 
-    if authorization != f"Bearer {TOKEN}":
+    # Accept X-Arbex-Webhook-Secret (Arbex standard) or legacy Bearer token
+    auth_ok = (x_arbex_webhook_secret == TOKEN) or (authorization == f"Bearer {TOKEN}")
+    if not auth_ok:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
     raw_body = await request.body()
