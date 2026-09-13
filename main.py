@@ -16,6 +16,16 @@ async def health():
     return {"status": "ok", "service": "arbex-shadow-webhook"}
 
 
+@app.post("/debug")
+async def debug(request: Request):
+    """Temporary debug endpoint — remove before production use"""
+    return {
+        "token_len": len(TOKEN),
+        "token_prefix": TOKEN[:6] if TOKEN else "",
+        "headers": dict(request.headers),
+    }
+
+
 @app.post("/webhook")
 async def webhook(
     request: Request,
