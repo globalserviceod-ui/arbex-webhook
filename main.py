@@ -22,6 +22,10 @@ import time
 import uuid
 from datetime import datetime, timezone
 
+from collections import deque
+
+from collections import deque
+
 from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import JSONResponse
 
@@ -34,7 +38,11 @@ from fastapi.responses import JSONResponse
 _SECRET_RAW = os.environ.get("ARBEX_WEBHOOK_SECRET") or os.environ.get("ARBEX_WEBHOOK_TOKEN") or ""
 SECRET: bytes = _SECRET_RAW.encode()
 
-MAX_BODY_BYTES = 512 * 1024  # 512 KB — достаточно для любого Arbex payload
+MAX_BODY_BYTES = 512 * 1024  # 512 KB
+
+# Кольцевой буфер — последние 500 событий в памяти
+# Сбрасывается при редеплое, для shadow-режима достаточно
+EVENTS_BUFFER: deque = deque(maxlen=500)
 
 # ---------------------------------------------------------------------------
 # Логирование — структурированный JSON в stdout
@@ -177,7 +185,41 @@ async def webhook(
         payload=payload,
     )
 
+    # Сохраняем в буфер для GET /events
+    EVENTS_BUFFER.append({
+        "received_utc_ms": received_utc_ms,
+        "request_id": request_id,
+        "payload": payload,
+    })
+
     return JSONResponse(
         status_code=200,
         content={"status": "accepted", "received_utc_ms": received_utc_ms, "request_id": request_id},
     )
+
+
+@app.get("/events")
+async def events(
+    authorization: str | None = Header(default=None),
+    limit: int = 50,
+) -> JSONResponse:
+    """
+    Отдаёт последние события из буфера.
+    Авторизация: Bearer <ARBEX_WEBHOOK_SECRET>
+    Параметр: ?limit=N (макс 500, по умолчанию 50)
+    """
+    bearer_value = None
+    if authorization and authorization.lower().startswith("bearer "):
+        bearer_value = authorization[7:]
+
+    if not _check_secret(bearer_value):
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    limit = max(1, min(limit, 500))
+    items = list(EVENTS_BUFFER)[-limit:]
+
+    return JSONResponse(content={
+        "count": len(items),
+        "total_buffered": len(EVENTS_BUFFER),
+        "events": items,
+    })
