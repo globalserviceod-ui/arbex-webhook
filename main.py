@@ -1,20 +1,112 @@
-from fastapi import FastAPI, Request, Header, HTTPException
-from datetime import datetime, timezone
+"""
+Arbex Shadow Webhook Receiver
+------------------------------
+Принимает lifecycle-события от Arbex PriceArb Feed.
+Shadow-режим: только приём и логирование, без торговых ордеров.
+
+Архитектура хранения:
+  Railway filesystem — ephemeral (стирается при деплое).
+  Все события пишутся в stdout как JSON-строки.
+  Railway автоматически собирает stdout в персистентные логи.
+  Для долгосрочного хранения — добавить Railway Postgres / S3 в будущем.
+"""
+
+from __future__ import annotations
+
+import hmac
 import json
+import logging
 import os
+import re
 import time
+import uuid
+from datetime import datetime, timezone
 
-app = FastAPI()
+from fastapi import FastAPI, Header, HTTPException, Request
+from fastapi.responses import JSONResponse
 
-TOKEN = os.environ.get("ARBEX_WEBHOOK_SECRET", os.environ.get("ARBEX_WEBHOOK_TOKEN", ""))
+# ---------------------------------------------------------------------------
+# Конфигурация
+# ---------------------------------------------------------------------------
 
-os.makedirs("received", exist_ok=True)
+# Поддерживаем оба имени переменной для плавной миграции.
+# Приоритет: ARBEX_WEBHOOK_SECRET > ARBEX_WEBHOOK_TOKEN
+_SECRET_RAW = os.environ.get("ARBEX_WEBHOOK_SECRET") or os.environ.get("ARBEX_WEBHOOK_TOKEN") or ""
+SECRET: bytes = _SECRET_RAW.encode()
 
+MAX_BODY_BYTES = 512 * 1024  # 512 KB — достаточно для любого Arbex payload
+
+# ---------------------------------------------------------------------------
+# Логирование — структурированный JSON в stdout
+# Каждая строка = один JSON-объект; Railway Logs их индексирует.
+# ---------------------------------------------------------------------------
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(message)s",  # только сам текст — JSON будем формировать вручную
+)
+logger = logging.getLogger("arbex_webhook")
+
+
+def _log(level: str, event: str, **fields) -> None:
+    """Пишет одну JSON-строку в stdout."""
+    record = {
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "level": level,
+        "event": event,
+        **fields,
+    }
+    # print гарантирует flush в stdout; logger.info добавил бы лишний prefix
+    print(json.dumps(record, ensure_ascii=False, default=str), flush=True)
+
+
+# ---------------------------------------------------------------------------
+# Приложение
+# ---------------------------------------------------------------------------
+
+# docs/redoc отключены: раскрывают схему заголовков, включая имя секрета
+app = FastAPI(
+    title="Arbex Shadow Webhook",
+    docs_url=None,
+    redoc_url=None,
+    openapi_url=None,
+)
+
+_log("INFO", "startup", secret_configured=bool(SECRET))
+
+
+# ---------------------------------------------------------------------------
+# Хелперы
+# ---------------------------------------------------------------------------
+
+_SAFE_ID_RE = re.compile(r"[^a-zA-Z0-9_\-]")
+
+
+def _safe_id(value: object, max_len: int = 64) -> str:
+    """Санитизирует произвольное значение для использования в логах/именах."""
+    if not isinstance(value, str):
+        return "unknown"
+    cleaned = _SAFE_ID_RE.sub("_", value)[:max_len]
+    return cleaned or "unknown"
+
+
+def _check_secret(provided: str | None) -> bool:
+    """Constant-time сравнение через hmac.compare_digest (защита от timing attack)."""
+    if not provided:
+        return False
+    try:
+        return hmac.compare_digest(provided.encode(), SECRET)
+    except Exception:
+        return False
+
+
+# ---------------------------------------------------------------------------
+# Эндпоинты
+# ---------------------------------------------------------------------------
 
 @app.get("/health")
-async def health():
+async def health() -> dict:
     return {"status": "ok", "service": "arbex-shadow-webhook"}
-
 
 
 @app.post("/webhook")
@@ -22,38 +114,70 @@ async def webhook(
     request: Request,
     x_arbex_webhook_secret: str | None = Header(default=None),
     authorization: str | None = Header(default=None),
-):
-    if not TOKEN:
-        raise HTTPException(status_code=500, detail="Token not configured")
+) -> JSONResponse:
+    received_utc_ms = int(time.time() * 1000)
+    request_id = str(uuid.uuid4())
 
-    # Accept X-Arbex-Webhook-Secret (Arbex standard) or legacy Bearer token
-    auth_ok = (x_arbex_webhook_secret == TOKEN) or (authorization == f"Bearer {TOKEN}")
+    # -- 1. Проверка конфигурации --
+    if not SECRET:
+        _log("ERROR", "webhook.misconfigured", request_id=request_id)
+        raise HTTPException(status_code=503, detail="Service unavailable")
+
+    # -- 2. Аутентификация --
+    # Принимаем X-Arbex-Webhook-Secret (стандарт Arbex) или Bearer-токен (legacy).
+    bearer_value = None
+    if authorization and authorization.lower().startswith("bearer "):
+        bearer_value = authorization[7:]
+
+    auth_ok = _check_secret(x_arbex_webhook_secret) or _check_secret(bearer_value)
     if not auth_ok:
+        _log("WARN", "webhook.auth_failed", request_id=request_id,
+             remote=request.client.host if request.client else "unknown")
         raise HTTPException(status_code=401, detail="Unauthorized")
 
+    # -- 3. Ограничение размера тела --
     raw_body = await request.body()
-    received_utc_ms = int(time.time() * 1000)
+    if len(raw_body) > MAX_BODY_BYTES:
+        _log("WARN", "webhook.payload_too_large", request_id=request_id,
+             size=len(raw_body))
+        raise HTTPException(status_code=413, detail="Payload too large")
 
+    if not raw_body:
+        raise HTTPException(status_code=400, detail="Empty body")
+
+    # -- 4. Парсинг --
     try:
         payload = json.loads(raw_body)
-    except json.JSONDecodeError:
+    except json.JSONDecodeError as exc:
+        _log("WARN", "webhook.invalid_json", request_id=request_id, error=str(exc))
         raise HTTPException(status_code=400, detail="Invalid JSON")
 
-    record = {
-        "received_utc_ms": received_utc_ms,
-        "received_utc": datetime.now(timezone.utc).isoformat(),
-        "headers": dict(request.headers),
-        "payload": payload,
+    if not isinstance(payload, dict):
+        _log("WARN", "webhook.not_object", request_id=request_id,
+             got_type=type(payload).__name__)
+        raise HTTPException(status_code=400, detail="JSON object expected")
+
+    # -- 5. Логирование события в stdout (персистентно через Railway Logs) --
+    # Секрет из заголовков намеренно исключён.
+    safe_headers = {
+        k: "[REDACTED]" if k.lower() in {"x-arbex-webhook-secret", "authorization"} else v
+        for k, v in request.headers.items()
     }
 
-    filename = f"received/{received_utc_ms}_{payload.get('opportunity_id', 'unknown')}.json"
-    with open(filename, "w") as f:
-        json.dump(record, f, indent=2)
-
-    print(
-        f"[WEBHOOK] received={received_utc_ms} "
-        f"opportunity_id={payload.get('opportunity_id')} "
-        f"event_type={payload.get('event_type')}"
+    _log(
+        "INFO",
+        "webhook.received",
+        request_id=request_id,
+        received_utc_ms=received_utc_ms,
+        opportunity_id=_safe_id(payload.get("opportunity_id")),
+        event_type=payload.get("event_type"),
+        sequence=payload.get("sequence"),
+        schema_version=safe_headers.get("x-arbex-schema-version"),
+        headers=safe_headers,
+        payload=payload,
     )
 
-    return {"status": "accepted", "received_utc_ms": received_utc_ms}
+    return JSONResponse(
+        status_code=200,
+        content={"status": "accepted", "received_utc_ms": received_utc_ms, "request_id": request_id},
+    )
