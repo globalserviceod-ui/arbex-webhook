@@ -29,6 +29,35 @@ from collections import deque
 from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import JSONResponse
 
+
+def _relay_to_paper(payload: dict) -> None:
+    """Перенаправляет событие в arbex-paper /webhook."""
+    import urllib.request
+    import json
+    
+    paper_url = os.environ.get("ARBEX_PAPER_WEBHOOK_URL")
+    if not paper_url:
+        return
+    
+    secret = os.environ.get("ARBEX_WEBHOOK_SECRET", "")
+    body = json.dumps(payload).encode("utf-8")
+    
+    try:
+        req = urllib.request.Request(
+            f"https://{paper_url}/webhook",
+            data=body,
+            headers={
+                "Content-Type": "application/json",
+                "X-Arbex-Webhook-Secret": secret,
+            },
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            pass  # fire-and-forget
+    except Exception as e:
+        print(f"[RELAY ERROR] {e}", flush=True)
+
+
 # ---------------------------------------------------------------------------
 # Конфигурация
 # ---------------------------------------------------------------------------
@@ -186,6 +215,9 @@ async def webhook(
     )
 
     # Сохраняем в буфер для GET /events
+    # Relay в paper-trader (если configured)
+    _relay_to_paper(payload)
+    
     EVENTS_BUFFER.append({
         "received_utc_ms": received_utc_ms,
         "request_id": request_id,
