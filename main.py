@@ -32,6 +32,7 @@ from fastapi.responses import JSONResponse
 
 def _relay_to_paper(payload: dict) -> None:
     """Перенаправляет событие в arbex-paper /webhook."""
+    print("[RELAY] Starting relay...", flush=True)
     import urllib.request
     import json
     
