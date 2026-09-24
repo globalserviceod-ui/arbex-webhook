@@ -53,7 +53,8 @@ def _relay_to_paper(payload: dict) -> None:
             method="POST",
         )
         with urllib.request.urlopen(req, timeout=5) as resp:
-            pass  # fire-and-forget
+            status = resp.status
+        print(f"[RELAY] → paper status={status} opp={payload.get("opportunity_id","?")[:30]}", flush=True)
     except Exception as e:
         print(f"[RELAY ERROR] {e}", flush=True)
 
